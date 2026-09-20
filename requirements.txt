@@ -1,6 +1,6 @@
-numpy
-pandas
-matplotlib
-scipy
-pandas_datareader
-requests
+numpy>=1.24,<3
+pandas>=2,<4
+scipy>=1.10,<2
+matplotlib>=3.7,<4
+QuantLib>=1.34,<2
+requests>=2.31,<3

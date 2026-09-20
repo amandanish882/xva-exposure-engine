@@ -1,0 +1,9 @@
+{
+  "metadata": {"kind": "synthetic", "description": "Deterministic offline test fixture. These are not market observations.", "rate_volatility": "assumed synthetic", "correlation": "assumed synthetic"},
+  "curve": {"tenors": [1, 2, 3, 5, 7, 10], "zero_rates": [0.043, 0.041, 0.040, 0.039, 0.040, 0.041]},
+  "hw_a": 0.05, "hw_sigma": 0.008,
+  "eq_spot": 5000, "fx_spot": 1.10,
+  "eq_vol": 0.20, "fx_vol": 0.10,
+  "eq_dividend": 0.015, "foreign_rate": 0.025,
+  "correlation": [[1,-0.2,0.15],[-0.2,1,0.3],[0.15,0.3,1]]
+}

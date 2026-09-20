@@ -1,183 +1,162 @@
+"""Ex-payment-date values. Schedules are fixed; floating coupons use past fixings."""
 import numpy as np
-from scipy.stats import norm
+from scipy.special import ndtr
+
+
+def schedule(maturity, freq):
+    if maturity <= 0 or freq <= 0 or int(freq) != freq:
+        raise ValueError("Positive maturity and integer frequency required")
+    dates = np.r_[np.arange(1, int(np.floor(maturity*freq))+1)/freq, maturity]
+    dates = np.unique(np.round(dates, 12))
+    return dates, np.diff(np.r_[0., dates])
+
+
+def grid_index(ctx, t):
+    idx = int(np.argmin(np.abs(ctx["time"]-t)))
+    if abs(ctx["time"][idx]-t) > 1e-9:
+        raise ValueError(f"Required reset/payment time {t} missing from simulation grid")
+    return idx
+
+
+def bond(ctx, i, T):
+    return ctx["model"].bond(float(ctx["time"][i]), float(T), ctx["x"][:, i])
+
 
 class Trade:
     def __init__(self, trade_id):
         self.trade_id = trade_id
 
-    def value(self, t_idx, ctx):
-        raise NotImplementedError
-
     def im_proxy(self, t_idx, ctx):
         return np.zeros(ctx["r"].shape[0])
+
 
 class InterestRateSwap(Trade):
     def __init__(self, trade_id, notional, fixed_rate, maturity, pay_fixed=True, pay_freq_per_year=4):
         super().__init__(trade_id)
-        self.notional = float(notional)
-        self.fixed_rate = float(fixed_rate)
-        self.maturity = float(maturity)
-        self.pay_fixed = bool(pay_fixed)
-        self.freq = int(pay_freq_per_year)
+        self.notional, self.fixed_rate = float(notional), float(fixed_rate)
+        self.maturity, self.pay_fixed = float(maturity), bool(pay_fixed)
+        self.pay_times, self.accruals = schedule(self.maturity, pay_freq_per_year)
+
+    @property
+    def event_times(self):
+        return self.pay_times
+
+    def par_rate(self, curve):
+        return float((1-curve.discount(self.maturity))/np.dot(self.accruals, curve.discount(self.pay_times)))
 
     def value(self, t_idx, ctx):
         t = float(ctx["time"][t_idx])
-        if t >= self.maturity:
+        remaining = np.flatnonzero(self.pay_times > t+1e-10)
+        if not len(remaining):
             return np.zeros(ctx["r"].shape[0])
-
-        tau = self.maturity - t
-
-        n_pay = max(1, int(np.ceil(tau * self.freq)))
-        pay_times = t + (np.arange(1, n_pay + 1) / self.freq)
-        pay_times = pay_times[pay_times <= self.maturity + 1e-12]
-
-        df_t = ctx["df"][:, t_idx]
-        dt = float(ctx["time"][1] - ctx["time"][0])
-
-        p_tu = []
-        for u in pay_times:
-            u_idx = int(round(u / dt))
-            u_idx = min(u_idx, len(ctx["time"]) - 1)
-            p_tu.append(ctx["df"][:, u_idx] / df_t)
-
-        if not p_tu:
-            return np.zeros(ctx["r"].shape[0])
-
-        p_tu = np.stack(p_tu, axis=1)
-
-        T_idx = int(round(self.maturity / dt))
-        T_idx = min(T_idx, len(ctx["time"]) - 1)
-        p_tT = ctx["df"][:, T_idx] / df_t
-
-        alpha = 1.0 / self.freq
-        annuity = alpha * np.sum(p_tu, axis=1)
-
-        float_leg = 1.0 - p_tT
-        fixed_leg = self.fixed_rate * annuity
-
-        pv = self.notional * (float_leg - fixed_leg)
-        return -pv if self.pay_fixed else pv
+        j = int(remaining[0])
+        reset = 0. if j == 0 else self.pay_times[j-1]
+        ri = grid_index(ctx, reset)
+        # The next floating coupon was fixed at the previous contractual reset.
+        reset_bond = bond(ctx, ri, self.pay_times[j])
+        float_leg = bond(ctx, t_idx, self.pay_times[j])/reset_bond - bond(ctx, t_idx, self.maturity)
+        annuity = sum(self.accruals[k]*bond(ctx, t_idx, self.pay_times[k]) for k in remaining)
+        payer = self.notional*(float_leg-self.fixed_rate*annuity)
+        return payer if self.pay_fixed else -payer
 
     def im_proxy(self, t_idx, ctx):
-        t = float(ctx["time"][t_idx])
-        if t >= self.maturity:
-            return np.zeros(ctx["r"].shape[0])
-        tau = self.maturity - t
-        dv01 = self.notional * tau * 1e-4
-        rw = 30.0
-        return np.full(ctx["r"].shape[0], abs(dv01) * rw)
+        tau = max(self.maturity-float(ctx["time"][t_idx]), 0.)
+        return np.full(ctx["r"].shape[0], abs(self.notional)*tau*1e-4*30)
+
 
 class EuropeanOption(Trade):
-    def __init__(self, trade_id, underlying, strike, maturity, opt_type="call"):
+    def __init__(self, trade_id, underlying, strike, maturity, opt_type="call", units=1.):
         super().__init__(trade_id)
-        self.underlying = underlying  # "S" or "FX"
-        self.K = float(strike)
-        self.T = float(maturity)
-        self.is_call = (opt_type == "call")
+        if underlying not in ("S", "FX") or opt_type not in ("call", "put") or strike <= 0 or maturity <= 0:
+            raise ValueError("Invalid European option")
+        self.underlying, self.K, self.T = underlying, float(strike), float(maturity)
+        self.is_call, self.units = opt_type == "call", float(units)
+
+    @property
+    def event_times(self):
+        return [self.T]
+
+    def payoff(self, spot):
+        return self.units*np.maximum((spot-self.K) if self.is_call else (self.K-spot), 0.)
+
+    def _inputs(self, i, ctx):
+        tau = self.T-float(ctx["time"][i])
+        md = ctx["md"]
+        sigma = md.eq_vol if self.underlying == "S" else md.fx_vol
+        carry = md.eq_dividend if self.underlying == "S" else md.foreign_rate
+        rho = md.corr[0, 1 if self.underlying == "S" else 2]
+        discount = bond(ctx, i, self.T)
+        prepaid = ctx[self.underlying][:, i]*np.exp(-carry*tau)
+        v = ctx["model"].option_variance(tau, sigma, rho)
+        return discount, prepaid, float(v), carry, tau
 
     def value(self, t_idx, ctx):
-        t = float(ctx["time"][t_idx])
-        spot = ctx[self.underlying][:, t_idx]
-        if t >= self.T:
-            payoff = np.maximum(spot - self.K, 0.0) if self.is_call else np.maximum(self.K - spot, 0.0)
-            return payoff
-
-        r = ctx["r"][:, t_idx]
-        tau = self.T - t
-        vol = ctx["md"].eq_vol if self.underlying == "S" else ctx["md"].fx_vol
-
-        d1 = (np.log(spot / self.K) + (r + 0.5 * vol * vol) * tau) / (vol * np.sqrt(tau))
-        d2 = d1 - vol * np.sqrt(tau)
-
-        if self.is_call:
-            return spot * norm.cdf(d1) - self.K * np.exp(-r * tau) * norm.cdf(d2)
-        return self.K * np.exp(-r * tau) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+        if ctx["time"][t_idx] >= self.T-1e-10:
+            return np.zeros(ctx["r"].shape[0])  # cash-settled; payoff is a separate cashflow
+        p, s, var, _, _ = self._inputs(t_idx, ctx)
+        if var < 1e-20:
+            return self.units*np.maximum(s-self.K*p if self.is_call else self.K*p-s, 0.)
+        std = np.sqrt(var)
+        d1 = np.log(s/(self.K*p))/std + 0.5*std
+        d2 = d1-std
+        sign = 1 if self.is_call else -1
+        return self.units*sign*(s*ndtr(sign*d1)-self.K*p*ndtr(sign*d2))
 
     def im_proxy(self, t_idx, ctx):
-        t = float(ctx["time"][t_idx])
-        if t >= self.T:
+        if ctx["time"][t_idx] >= self.T-1e-10:
             return np.zeros(ctx["r"].shape[0])
+        p, s, var, carry, tau = self._inputs(t_idx, ctx)
+        d1 = np.log(s/(self.K*p))/np.sqrt(max(var, 1e-20)) + 0.5*np.sqrt(var)
+        delta = np.exp(-carry*tau)*(ndtr(d1)-(0 if self.is_call else 1))
+        return 0.15*abs(self.units)*np.abs(delta)*ctx[self.underlying][:, t_idx]
 
-        spot = ctx[self.underlying][:, t_idx]
-        r = ctx["r"][:, t_idx]
-        tau = self.T - t
-        vol = ctx["md"].eq_vol if self.underlying == "S" else ctx["md"].fx_vol
-
-        d1 = (np.log(spot / self.K) + (r + 0.5 * vol * vol) * tau) / (vol * np.sqrt(tau))
-        delta = norm.cdf(d1) if self.is_call else (norm.cdf(d1) - 1.0)
-
-        rw = 0.15 if self.underlying == "S" else 0.10
-        return rw * np.abs(delta) * spot
 
 class FXForward(Trade):
     def __init__(self, trade_id, notional_foreign, strike, maturity):
         super().__init__(trade_id)
-        self.N = float(notional_foreign)
-        self.K = float(strike)
-        self.T = float(maturity)
+        self.N, self.K, self.T = float(notional_foreign), float(strike), float(maturity)
+
+    @property
+    def event_times(self):
+        return [self.T]
 
     def value(self, t_idx, ctx):
-        t = float(ctx["time"][t_idx])
-        if t >= self.T:
+        tau = self.T-float(ctx["time"][t_idx])
+        if tau <= 1e-10:
             return np.zeros(ctx["r"].shape[0])
-
-        spot = ctx["FX"][:, t_idx]
-        r = ctx["r"][:, t_idx]
-        tau = self.T - t
-        fwd = spot * np.exp(r * tau)
-        df = np.exp(-r * tau)
-        return self.N * (fwd - self.K) * df
+        return self.N*(ctx["FX"][:, t_idx]*np.exp(-ctx["md"].foreign_rate*tau)-self.K*bond(ctx, t_idx, self.T))
 
     def im_proxy(self, t_idx, ctx):
-        spot = ctx["FX"][:, t_idx]
-        rw = 0.08
-        return rw * np.abs(self.N) * spot
+        return (0.08*abs(self.N)*ctx["FX"][:, t_idx] if ctx["time"][t_idx] < self.T-1e-10
+                else np.zeros(ctx["r"].shape[0]))
+
 
 class XCCYSwapSimple(Trade):
-    def __init__(self, trade_id, notional_dom, notional_for, dom_fixed, for_fixed, maturity, pay_domestic=True, pay_freq_per_year=2):
+    """Fixed-fixed currency swap with terminal principals; deterministic foreign curve."""
+    def __init__(self, trade_id, notional_dom, notional_for, dom_fixed, for_fixed, maturity,
+                 pay_domestic=True, pay_freq_per_year=2):
         super().__init__(trade_id)
-        self.Nd = float(notional_dom)
-        self.Nf = float(notional_for)
-        self.kd = float(dom_fixed)
-        self.kf = float(for_fixed)
-        self.T = float(maturity)
-        self.pay_domestic = bool(pay_domestic)
-        self.freq = int(pay_freq_per_year)
+        self.Nd, self.Nf, self.kd, self.kf = map(float, (notional_dom, notional_for, dom_fixed, for_fixed))
+        self.T, self.pay_domestic = float(maturity), bool(pay_domestic)
+        self.pay_times, self.accruals = schedule(self.T, pay_freq_per_year)
+
+    @property
+    def event_times(self):
+        return self.pay_times
 
     def value(self, t_idx, ctx):
         t = float(ctx["time"][t_idx])
-        if t >= self.T:
+        if t >= self.T-1e-10:
             return np.zeros(ctx["r"].shape[0])
-
-        spot_fx = ctx["FX"][:, t_idx]
-        df_t = ctx["df"][:, t_idx]
-        dt = float(ctx["time"][1] - ctx["time"][0])
-
-        tau = self.T - t
-        n_pay = max(1, int(np.ceil(tau * self.freq)))
-        pay_times = t + (np.arange(1, n_pay + 1) / self.freq)
-        pay_times = pay_times[pay_times <= self.T + 1e-12]
-
-        alpha = 1.0 / self.freq
-        pv_dom = np.zeros(ctx["r"].shape[0])
-        pv_for = np.zeros(ctx["r"].shape[0])
-
-        for u in pay_times:
-            u_idx = int(round(u / dt))
-            u_idx = min(u_idx, len(ctx["time"]) - 1)
-            p_tu = ctx["df"][:, u_idx] / df_t
-            pv_dom += self.Nd * self.kd * alpha * p_tu
-            pv_for += (self.Nf * self.kf * alpha * p_tu) * spot_fx
-
-        T_idx = int(round(self.T / dt))
-        T_idx = min(T_idx, len(ctx["time"]) - 1)
-        p_tT = ctx["df"][:, T_idx] / df_t
-        pv_exchange = (self.Nf * spot_fx - self.Nd) * p_tT
-
-        pv = (pv_for - pv_dom) + pv_exchange
-        return -pv if self.pay_domestic else pv
+        domestic = self.Nd*bond(ctx, t_idx, self.T)
+        foreign = self.Nf*np.exp(-ctx["md"].foreign_rate*(self.T-t))
+        for u, alpha in zip(self.pay_times, self.accruals):
+            if u > t+1e-10:
+                domestic += self.Nd*self.kd*alpha*bond(ctx, t_idx, u)
+                foreign += self.Nf*self.kf*alpha*np.exp(-ctx["md"].foreign_rate*(u-t))
+        v = foreign*ctx["FX"][:, t_idx]-domestic
+        return v if self.pay_domestic else -v
 
     def im_proxy(self, t_idx, ctx):
-        spot = ctx["FX"][:, t_idx]
-        rw = 0.10
-        return rw * np.abs(self.Nf) * spot
+        return (0.10*abs(self.Nf)*ctx["FX"][:, t_idx] if ctx["time"][t_idx] < self.T-1e-10
+                else np.zeros(ctx["r"].shape[0]))
