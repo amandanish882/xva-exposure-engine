@@ -1,90 +1,71 @@
+"""Simplified unilateral threshold/MTA collateral with an explicit observation lag."""
+from dataclasses import dataclass
 import numpy as np
 
+
+@dataclass
 class CSA:
-    def __init__(self, threshold=0.0, mta=0.0, call_frequency_days=1, mpor_days=10):
-        self.threshold = float(threshold)
-        self.mta = float(mta)
-        self.call_frequency_days = int(call_frequency_days)
-        self.mpor_days = int(mpor_days)
+    threshold: float = 0.
+    mta: float = 0.
+    call_frequency_days: float = 1.
+    mpor_days: float = 10.
+
+    def __post_init__(self):
+        if (not np.isfinite([self.threshold, self.mta, self.mpor_days, self.call_frequency_days]).all()
+                or min(self.threshold, self.mta, self.mpor_days) < 0 or self.call_frequency_days <= 0):
+            raise ValueError("Invalid collateral settings")
+
 
 class ExposureEngine:
     def __init__(self, ctx):
-        self.ctx = ctx
-        self.trades = []
-        self.netting = {}
+        self.ctx, self.trades, self.netting = ctx, [], {}
 
     def add_trade(self, trade, netting_set_id, csa=None):
+        if any(t.trade_id == trade.trade_id for t in self.trades):
+            raise ValueError("Duplicate trade id")
+        csa = csa or CSA(threshold=1e18, mpor_days=0)
+        if netting_set_id in self.netting and self.netting[netting_set_id]["csa"] != csa:
+            raise ValueError("Inconsistent CSA within netting set")
         self.trades.append(trade)
-        if netting_set_id not in self.netting:
-            if csa is None:
-                csa = CSA(threshold=1e18, mta=0.0, call_frequency_days=1, mpor_days=0)
-            self.netting[netting_set_id] = {"trades": [], "csa": csa}
-        self.netting[netting_set_id]["trades"].append(trade)
+        self.netting.setdefault(netting_set_id, {"trades": [], "csa": csa})["trades"].append(trade)
 
     def run(self):
         time = self.ctx["time"]
-        n_steps = len(time)
-        n_sims = self.ctx["r"].shape[0]
-        dt_years = float(time[1] - time[0])
-        dt_days = max(1e-9, dt_years * 365.0)
-
-        mtm = np.zeros((n_steps, n_sims, len(self.trades)))
-        im_trade = np.zeros((n_steps, n_sims, len(self.trades)))
-
-        print(f"Pricing {len(self.trades)} trades over {n_steps} steps...")
-        for t in range(n_steps):
-            for i, tr in enumerate(self.trades):
-                mtm[t, :, i] = tr.value(t, self.ctx)
-                im_trade[t, :, i] = tr.im_proxy(t, self.ctx)
-
+        shape = (len(time), self.ctx["r"].shape[0])
         results = {}
-
         for ns_id, ns in self.netting.items():
             csa = ns["csa"]
-            idx = [self.trades.index(tr) for tr in ns["trades"]]
-            ns_mtm = np.sum(mtm[:, :, idx], axis=2)
-            ns_im = np.sum(im_trade[:, :, idx], axis=2)
-
-            collateral = np.zeros(n_sims)
-
-            call_every = max(1, int(round(csa.call_frequency_days / dt_days)))
-            lag_idx = max(0, int(round(csa.mpor_days / dt_days)))
-
-            exposure = np.zeros_like(ns_mtm)
-            im_profile = np.zeros_like(ns_mtm)
-
-            for t in range(n_steps):
-                if (t % call_every) == 0:
-                    t_lag = max(0, t - lag_idx)
-                    mtm_lag = ns_mtm[t_lag, :]
-
-                    target = np.maximum(mtm_lag - csa.threshold, 0.0)
-
-                    change = target - collateral
-                    do_change = np.abs(change) > csa.mta
-                    collateral = np.where(do_change, target, collateral)
-
-                exposure[t, :] = np.maximum(ns_mtm[t, :] - collateral, 0.0)
-                im_profile[t, :] = np.maximum(ns_im[t, :], 0.0)
-
-            results[ns_id] = {
-                "EPE": np.mean(exposure, axis=1),
-                "PFE": np.percentile(exposure, 95, axis=1),
-                "ExposurePaths": exposure,
-                "IMPaths": im_profile
-            }
-
-        total_exposure = np.zeros((n_steps, n_sims))
-        total_im = np.zeros((n_steps, n_sims))
-        for ns_id in results:
-            total_exposure += results[ns_id]["ExposurePaths"]
-            total_im += results[ns_id]["IMPaths"]
-
-        results["PORTFOLIO"] = {
-            "EPE": np.mean(total_exposure, axis=1),
-            "PFE": np.percentile(total_exposure, 95, axis=1),
-            "ExposurePaths": total_exposure,
-            "IMPaths": total_im
-        }
-
+            resolution = min(csa.call_frequency_days, csa.mpor_days or csa.call_frequency_days)
+            if np.max(np.diff(time))*365 > resolution+1e-7:
+                raise ValueError("Simulation grid too coarse for collateral calls/lag")
+            mtm, im = np.zeros(shape), np.zeros(shape)
+            for tr in ns["trades"]:
+                for i in range(len(time)):
+                    mtm[i] += tr.value(i, self.ctx)
+                    im[i] += tr.im_proxy(i, self.ctx)
+            collateral = np.zeros(shape)
+            balance = np.zeros(shape[1])
+            next_call = 0.
+            for i, t in enumerate(time):
+                day = t*365
+                if day+1e-7 >= next_call:
+                    lag_time = t-csa.mpor_days/365
+                    j = np.searchsorted(time, lag_time+1e-10, side="right")-1
+                    target = np.maximum((mtm[j] if j >= 0 else 0.)-csa.threshold, 0.)
+                    balance = np.where(np.abs(target-balance) > csa.mta, target, balance)
+                    next_call = (np.floor((day+1e-7)/csa.call_frequency_days)+1)*csa.call_frequency_days
+                collateral[i] = balance
+            exposure = np.maximum(mtm-collateral, 0.)
+            results[ns_id] = self._metrics(exposure, im)
+            results[ns_id].update(MtM=mtm, Collateral=collateral)
+        if not results:
+            raise ValueError("No trades")
+        results["PORTFOLIO"] = self._metrics(
+            sum(d["ExposurePaths"] for d in results.values()),
+            sum(d["IMPaths"] for d in results.values()))
         return results
+
+    @staticmethod
+    def _metrics(exposure, im):
+        return {"EPE": exposure.mean(axis=1), "PFE": np.percentile(exposure, 95, axis=1),
+                "ExposurePaths": exposure, "IMPaths": im}

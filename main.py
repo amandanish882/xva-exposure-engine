@@ -1,88 +1,108 @@
-import numpy as np
+"""Offline by default; pass --snapshot data/local_market.json for calibrated inputs."""
+import argparse
+import json
+from pathlib import Path
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
+import numpy as np
 from src.market_data import MarketData
 from src.engine import MonteCarloEngine
 from src.instruments import InterestRateSwap, EuropeanOption, FXForward, XCCYSwapSimple
 from src.exposure import ExposureEngine, CSA
 from src.xva import XVAEngine
+from src.risk import swap_risk
 
-def build_portfolio(ctx):
-    exp = ExposureEngine(ctx)
 
-    csa_bank = CSA(threshold=1e18, mta=0.0, call_frequency_days=1, mpor_days=0)
-    exp.add_trade(InterestRateSwap("IRS1", 1_000_000, 0.04, 4.0, pay_fixed=True), "NS_BANK", csa_bank)
-    exp.add_trade(FXForward("FXFWD1", 500_000, 1.12, 1.0), "NS_BANK", csa_bank)
-    exp.add_trade(XCCYSwapSimple("XCCY1", notional_dom=1_000_000, notional_for=900_000, dom_fixed=0.035, for_fixed=0.02, maturity=3.0), "NS_BANK", csa_bank)
+def portfolio(md):
+    swap = InterestRateSwap("IRS1", 1_000_000, 0., 4.)
+    swap.fixed_rate = swap.par_rate(md.curve)
+    option_T = md.iv_quotes.get("equity", {}).get("expiry_years", 2.)
+    if option_T > 5:
+        raise ValueError("Demo option outside five-year horizon")
+    forward_strike = md.fx_spot*np.exp(-md.foreign_rate)/md.curve.discount(1.)
+    # Identical swap on a second counterparty makes collateral effects visible.
+    return [
+        (swap, "NS_BANK", CSA(threshold=1e18, mpor_days=0)),
+        (FXForward("FXFWD1", 500_000, forward_strike, 1.), "NS_BANK", CSA(threshold=1e18, mpor_days=0)),
+        (XCCYSwapSimple("XCCY1", 1_000_000, 1_000_000/md.fx_spot, 0.035, 0.02, 3.),
+         "NS_BANK", CSA(threshold=1e18, mpor_days=0)),
+        (InterestRateSwap("IRS_CORP", 1_000_000, swap.fixed_rate, 4.), "NS_CORP", CSA(threshold=25_000, mta=5_000)),
+        (EuropeanOption("EQOPT1", "S", md.eq_spot, option_T, units=100), "NS_CORP", CSA(threshold=25_000, mta=5_000))
+    ]
 
-    csa_corp = CSA(threshold=25_000.0, mta=5_000.0, call_frequency_days=1, mpor_days=10)
-    exp.add_trade(EuropeanOption("EQOPT1", "S", 4100.0, 2.0, "call"), "NS_CORP", csa_corp)
 
-    return exp
+def run_scenario(md, trades, n_sims=2000, seed=42, hazard=0.02):
+    events = np.concatenate([np.asarray(tr.event_times) for tr, _, _ in trades])
+    ctx = MonteCarloEngine(md, {"n_sims": n_sims, "time_horizon": 5.,
+                                "event_times": events, "antithetic": True}).simulate(seed)
+    engine = ExposureEngine(ctx)
+    for tr, ns, csa in trades:
+        engine.add_trade(tr, ns, csa)
+    exposure = engine.run()
+    xva = XVAEngine(ctx, exposure).compute(hazard_rate=hazard)
+    return ctx, exposure, xva
 
-def run_scenario(name, md_shock=None, hazard_rate=0.02):
-    print(f"\n=== Scenario: {name} ===")
-    md = MarketData()
-    md.calibrate_from_fred()
-    if md_shock:
-        md_shock(md)
-
-    config = {"n_sims": 600, "n_steps": 80, "time_horizon": 5.0, "antithetic": True}
-    ctx = MonteCarloEngine(md, config).simulate(seed=42)
-    ctx["md"] = md
-
-    exp = build_portfolio(ctx)
-    exposure = exp.run()
-
-    xva = XVAEngine(ctx, exposure).compute(
-        hazard_rate=hazard_rate,
-        recovery=0.4,
-        funding_spread=0.01,
-        im_funding_spread=0.01
-    )
-
-    print("XVA (Portfolio):", {k: round(xva["PORTFOLIO"][k], 2) for k in xva["PORTFOLIO"]})
-    return ctx["time"], exposure, xva
 
 def main():
-    t, exp_base, xva_base = run_scenario("Base", md_shock=None, hazard_rate=0.02)
-
-    def shock(md):
-        md.shock(dr=0.01, eq_vol_mult=1.5, fx_vol_mult=1.5)
-        print("Applied shocks: r0 +1%, eq/fx vols x1.5")
-
-    t2, exp_stress, xva_stress = run_scenario("Stress_RatesVol_Credit", md_shock=shock, hazard_rate=0.03)
-
-    ns = "NS_CORP"
-    plt.figure(figsize=(10, 6))
-    plt.plot(t, exp_base[ns]["EPE"], label="Base EPE", linewidth=2)
-    plt.plot(t, exp_base[ns]["PFE"], label="Base PFE(95%)", linestyle="--")
-    plt.plot(t2, exp_stress[ns]["EPE"], label="Stress EPE", linewidth=2)
-    plt.plot(t2, exp_stress[ns]["PFE"], label="Stress PFE(95%)", linestyle="--")
-    plt.title(f"Exposure Profile - {ns} (CSA: Threshold+MTA+MPOR)")
-    plt.xlabel("Time (years)")
-    plt.ylabel("Exposure")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("exposure_profile.png")
-    print("Saved: exposure_profile.png")
-
+    p = argparse.ArgumentParser()
+    p.add_argument("--snapshot")
+    p.add_argument("--n-sims", type=int, default=2000)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--output", default="output")
+    args = p.parse_args()
+    md = MarketData(args.snapshot)
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    print(f"Input kind: {md.metadata.get('kind')} | asof: {md.metadata.get('asof', 'synthetic fixture')}")
+    trades = portfolio(md)  # Fixed contracts: never re-strike during a stress or bump.
+    ctx, base, xb = run_scenario(md, trades, args.n_sims, args.seed)
+    times = ctx["time"].copy()
+    del ctx
+    _, stress, xs = run_scenario(md.shocked(dr=.01, eq_vol_mult=1.5, fx_vol_mult=1.5),
+                                trades, args.n_sims, args.seed, hazard=.03)
+    risk = swap_risk(trades[0][0], md)
+    summary = {"data_kind": md.metadata.get("kind"), "asof": md.metadata.get("asof"),
+               "paths": args.n_sims, "seed": args.seed, "time_points": len(times),
+               "swap_risk": risk, "correlation": md.corr.tolist(), "base": xb, "stress": xs}
+    if not np.isfinite([v for group in (xb, xs) for d in group.values() for v in d.values()]).all():
+        raise ValueError("Nonfinite XVA result")
+    with open(out/"results.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False})
+    fig, axes = plt.subplots(1,2, figsize=(11,4))
+    grid = np.linspace(.001, 10, 800)
+    axes[0].plot(grid, 100*md.curve.zero(grid), label="Zero rate")
+    axes[0].plot(grid, 100*md.curve.forward(grid), label="Forward", alpha=.7)
+    axes[0].set(xlabel="Years", ylabel="Percent", title="Treasury proxy curve")
+    axes[0].legend()
+    axes[1].bar(list(risk["key_rate_dv01"]), list(risk["key_rate_dv01"].values()))
+    axes[1].set(xlabel="Curve node (years)", ylabel="USD / +1bp", title="Payer swap key-rate DV01")
+    fig.tight_layout()
+    fig.savefig(out/"curve_and_risk.png", dpi=140)
+    plt.close(fig)
+    fig, axes = plt.subplots(1,2, figsize=(11,4))
+    for ax, ns in zip(axes, ("NS_BANK", "NS_CORP")):
+        for label, values in (("Base", base), ("Stress", stress)):
+            ax.plot(times, values[ns]["EPE"], label=label+" EE")
+            ax.plot(times, values[ns]["PFE"], "--", label=label+" PFE95", alpha=.8)
+        ax.set(title=ns, xlabel="Years", ylabel="USD exposure")
+        ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out/"exposure_profile.png", dpi=140)
+    plt.close(fig)
+    fig, ax = plt.subplots(figsize=(7,4))
     labels = ["CVA", "FVA", "MVA", "Total"]
-    base_vals = [xva_base["PORTFOLIO"][k] for k in labels]
-    stress_vals = [xva_stress["PORTFOLIO"][k] for k in labels]
+    x = np.arange(4)
+    ax.bar(x-.2, [xb["PORTFOLIO"][k] for k in labels], .4, label="Base")
+    ax.bar(x+.2, [xs["PORTFOLIO"][k] for k in labels], .4, label="Stress")
+    ax.set(xticks=x, xticklabels=labels, ylabel="USD", title="XVA (funding and IM are proxies)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out/"xva_comparison.png", dpi=140)
+    plt.close(fig)
+    print(json.dumps({"swap": risk, "base": xb["PORTFOLIO"], "stress": xs["PORTFOLIO"]}, indent=2))
 
-    x = np.arange(len(labels))
-    plt.figure(figsize=(10, 6))
-    plt.bar(x - 0.2, base_vals, width=0.4, label="Base")
-    plt.bar(x + 0.2, stress_vals, width=0.4, label="Stress")
-    plt.xticks(x, labels)
-    plt.title("Portfolio XVA - Base vs Stress")
-    plt.grid(True, axis="y", alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("xva_comparison.png")
-    print("Saved: xva_comparison.png")
 
 if __name__ == "__main__":
     main()
