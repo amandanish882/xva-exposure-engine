@@ -5,7 +5,7 @@ correlated equity/FX paths, derivative valuation, collateralised exposure and XV
 The emphasis is on consistent pricing and testable assumptions, not production coverage.
 
 ```text
-Zero-curve nodes → discount curve → Hull–White bond prices → swap/option/FX values
+SR3 futures + SOFR fixings → discount curve → Hull–White → swap/option/FX values
                                        ↑                           ↓
 Historical correlation + option IV → correlated simulation → exposure → CVA
 ```
@@ -33,7 +33,7 @@ To run with locally calibrated market inputs:
 ```bash
 # Load DATABENTO_API_KEY and, preferably, FRED_API_KEY through your environment.
 # This command may incur data charges; each uncached request is costed first.
-python -m scripts.calibrate_market --asof 2026-09-20 --max-cost-usd 0.50
+python -m scripts.calibrate_market --asof 2026-09-11 --max-cost-usd 0.50
 python validate.py --snapshot data/local_market.json --output output/live_validation.json
 python main.py --snapshot data/local_market.json --output output/live
 ```
@@ -45,7 +45,7 @@ See [data and calibration](docs/DATA.md) for quote selection and limitations.
 
 | Component | Implementation |
 |---|---|
-| Initial curve | Continuously compounded zero nodes; linear interpolation of log discount factors |
+| Initial curve | Market mode: quarterly SOFR futures bootstrap with realised fixings and zero convexity adjustment; offline mode: synthetic zero nodes; log-discount interpolation |
 | Rates | One-factor Hull–White fitted to the initial curve; QuantLib conditional bond coefficients |
 | Cross-asset dependence | Historical weekly rate changes and equity/FX log returns; 10% shrinkage to identity; Cholesky shocks |
 | Equity/FX volatility | One maturity-relevant near-ATM European quote pair per asset; implied-volatility inversion, with FX futures-option proxy caveat |
@@ -56,7 +56,21 @@ See [data and calibration](docs/DATA.md) for quote selection and limitations.
 
 ### Rates and curve: the short explanation
 
-For a zero rate `z(T)`, construct `P(0,T) = exp(-z(T) T)`. Between nodes,
+In market mode, convert each quarterly SR3 futures price `Q` into
+`R = (100-Q)/100`. With the futures–forward convexity adjustment **set to zero**,
+strip discount factors sequentially:
+
+$$P(0,T_2)=\frac{P(0,T_1)}{1+R\,(T_2-T_1)_{\mathrm{ACT/360}}}.$$
+
+For the already-started front quarter, multiply its published daily SOFR accrual
+factors and remove that realised portion: `P(0,T_end) = realised_growth / total_growth`.
+Dates are actual quarterly IMM dates; weekends/holidays accrue simply between
+SOFR fixing business days. Every selected future must reprice, and the strip must
+cover the five-year simulation. There is no silent Treasury fallback or long-end
+extrapolation. This is a **SOFR-futures bootstrap, not a fit to OTC OIS swap quotes**.
+
+The offline fixture instead supplies synthetic zero rates directly. For a zero
+rate `z(T)`, construct `P(0,T) = exp(-z(T) T)`. In both modes, between nodes,
 interpolate `log P`. This keeps discount factors positive, allows negative rates,
 and produces piecewise-constant instantaneous forwards. The first forward is
 flat from time zero to the first node; extrapolation beyond the last node is rejected.
@@ -122,9 +136,11 @@ fixed percentage; see [validation results](docs/VALIDATION.md).
 
 ## Scope and limitations
 
-- The live curve uses FRED **fitted Treasury zero yields**, not SOFR/OIS market
-  instruments. This is discount-curve construction from supplied zeros, **not a
-  deposit/futures/swap bootstrap**, and not multi-curve pricing.
+- The market curve is bootstrapped from **quarterly SR3 futures**, not OTC OIS
+  quotes. Futures–forward convexity is deliberately omitted, not estimated to be
+  zero. Exact quote repricing does not validate that economic approximation.
+  One-month SR1 arithmetic-average futures, serials and multi-curve pricing are
+  not implemented. Vendor preliminary/final settlement status is retained.
 - Mean reversion is assumed at `a = 0.05/year`; rate volatility is a historical
   weekly-change proxy. The rate model is curve-fitted, **not calibrated to an
   OTC swaption or cap/floor volatility surface**.
@@ -140,7 +156,8 @@ fixed percentage; see [validation results](docs/VALIDATION.md).
 
 ## Code map and results
 
-`curves.py` and `rates.py` provide the curve/model; `market_data.py` loads inputs;
+`sofr_curve.py` bootstraps futures; `curves.py` and `rates.py` provide the curve/model;
+`market_data.py` loads inputs;
 `engine.py` simulates; `instruments.py` prices; `exposure.py` nets/collateralises;
 `xva.py` integrates; `risk.py` computes sensitivities and sampling errors.
 

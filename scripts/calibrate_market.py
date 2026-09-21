@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import requests
 import databento as db
-from src.curves import DiscountCurve
+from src.sofr_curve import SofrFuture, bootstrap_sofr
 from src.rates import HullWhite
 from src.market_data import estimate_correlation
 from src.calibration import clean_quotes, implied_vol, black_price
@@ -74,6 +74,56 @@ class Downloader:
         self.spent += cost
         frame.to_parquet(path)
         return frame
+
+
+def select_sofr_settlements(definitions, statistics, day):
+    """Use same-trade-date, actual EOD settlements of quarterly outright SR3.
+
+    Keep the latest message, including deletes, before validating it. Preserve
+    preliminary/final flags: Friday's EOD feed can still label prices preliminary.
+    Do not mislabel a preliminary settlement as final or a theoretical as actual.
+    """
+    defs = definitions.sort_index(kind="stable").drop_duplicates("instrument_id", keep="last").set_index("instrument_id")
+    defs = defs[(defs.instrument_class == "F") & defs.raw_symbol.str.fullmatch(r"SR3[HMUZ]\d{1,2}")
+                & defs.maturity_month.isin([3, 6, 9, 12]) & (defs.security_update_action != "D")]
+    stats = statistics[(statistics.stat_type == 3) &
+                       (pd.to_datetime(statistics.ts_ref, utc=True).dt.date == date.fromisoformat(day))]
+    stats = stats.sort_index(kind="stable").drop_duplicates("instrument_id", keep="last").set_index("instrument_id")
+    flags = stats.stat_flags.astype(int)
+    stats = stats[(stats.update_action == 1) & ((flags & 2) != 0) & ((flags & 8) == 0)
+                  & np.isfinite(stats.price) & stats.price.between(50, 110)]
+    matched = stats.join(defs[["raw_symbol", "maturity_year", "maturity_month", "expiration"]], how="inner")
+    futures, sources = [], {}
+    for _, row in matched.iterrows():
+        future = SofrFuture(str(row.raw_symbol), int(row.maturity_year), int(row.maturity_month), float(row.price))
+        # CME's maturity fields name the START quarter, not the delivery month.
+        expected_symbol = "SR3"+{3:"H", 6:"M", 9:"U", 12:"Z"}[future.month]
+        if not future.symbol.startswith(expected_symbol) or not str(future.year).endswith(future.symbol[len(expected_symbol):]):
+            raise ValueError("SR3 symbol and reference-quarter definition disagree")
+        expiration = pd.Timestamp(row.expiration).date()
+        if not 0 < (future.end-expiration).days <= 4:
+            raise ValueError("SR3 expiration inconsistent with reference quarter")
+        futures.append(future)
+        sources[future.symbol] = {"settlement_trade_date":day, "stat_flags":int(row.stat_flags),
+                                  "settlement_status":"final" if int(row.stat_flags) & 1 else "preliminary",
+                                  "settlement_event_time":str(row.ts_event)}
+    if not futures:
+        raise ValueError("No valid same-date actual SR3 settlements")
+    return futures, sources
+
+
+def sofr_curve(dl, day, fixings):
+    end = str(date.fromisoformat(day)+timedelta(days=1))
+    request = dict(dataset="GLBX.MDP3", stype_in="parent", symbols="SR3.FUT", start=day, end=end)
+    definitions = dl.get(f"{day}_SR3_definition", schema="definition", **request)
+    statistics = dl.get(f"{day}_SR3_statistics", schema="statistics", **request)
+    futures, sources = select_sofr_settlements(definitions, statistics, day)
+    curve, audit = bootstrap_sofr(date.fromisoformat(day), futures, fixings)
+    for row in audit["contracts"]:
+        row.update(sources[row["symbol"]])
+    if audit["max_price_error"] > 1e-8:
+        raise ValueError("SOFR futures repricing failed")
+    return curve, audit
 
 
 def chain(dl, dataset, root, day):
@@ -140,25 +190,31 @@ def main():
     args = parser.parse_args()
     PRIVATE.mkdir(parents=True, exist_ok=True)
     end = date.fromisoformat(args.asof)
-    ids = [f"THREEFY{i}" for i in range(1, 11)]
-    nodes = fred(ids, end-timedelta(days=30), end).dropna()
-    if nodes.empty:
-        raise ValueError("No common-date zero curve")
-    day = str(nodes.index[-1].date())
-    if (end-nodes.index[-1].date()).days > 14:
-        raise ValueError("Zero curve more than 14 calendar days stale")
-    curve = DiscountCurve(np.arange(1, 11), nodes.iloc[-1].to_numpy()/100)
-    history = fred(["DGS3MO", "SP500", "DEXUSEU"],
-                   nodes.index[-1].date()-timedelta(days=3*365), nodes.index[-1].date()).dropna()
-    if history.empty or history.index[-1].date() != nodes.index[-1].date():
-        raise ValueError("Curve and latest common spot observations must share an as-of date")
+    latest = fred(["DGS3MO", "SP500", "DEXUSEU"], end-timedelta(days=30), end).dropna()
+    if latest.empty or (end-latest.index[-1].date()).days > 14:
+        raise ValueError("No common FRED spot/rate date within 14 calendar days")
+    market_date = latest.index[-1].date()
+    day = str(market_date)
+    history = fred(["DGS3MO", "SP500", "DEXUSEU"], market_date-timedelta(days=3*365), market_date).dropna()
+    if history.empty or history.index[-1].date() != market_date:
+        raise ValueError("Historical inputs and selected market date disagree")
+    sofr = fred(["SOFR"], market_date-timedelta(days=3*365), market_date)
+    # Exclude the as-of day's fixing: it is published the NEXT business day.
+    fixings = {t.date():float(v)/100 for t,v in sofr.SOFR.dropna().items() if t.date() < market_date}
+    dl = Downloader(args.max_cost_usd)
+    curve, curve_audit = sofr_curve(dl, day, fixings)
     corr, corr_info = estimate_correlation(history)
+    comparison = {}
+    common = history.join(sofr).dropna()
+    for rate in ("DGS3MO", "SOFR"):
+        for frequency in ("daily", "weekly"):
+            matrix, info = estimate_correlation(common, rate_column=rate, frequency=frequency)
+            comparison[rate+"_"+frequency] = dict(info, shrunk_correlation=matrix.tolist())
     # Weekly rate increments: transparent historical diffusion-scale proxy.
     weekly = history.groupby(history.index.to_period("W-FRI")).tail(1)
     rate_sigma = float((weekly.DGS3MO.diff()/100).std(ddof=1)*np.sqrt(52))
     spot, fx = float(history.SP500.iloc[-1]), float(history.DEXUSEU.iloc[-1])
     model = HullWhite(curve, 0.05, rate_sigma)
-    dl = Downloader(args.max_cost_usd)
     eq_chain, _ = chain(dl, "OPRA.PILLAR", "SPX", day)
     fx_chain, _ = chain(dl, "GLBX.MDP3", "EUU", day)
     eq = choose_pair(eq_chain, 2., spot, curve)
@@ -170,16 +226,23 @@ def main():
     if not -0.05 < q < 0.15 or not -0.05 < rf < 0.20:
         raise ValueError("Unreasonable implied carry; check spot/forward synchronisation")
     data = {"metadata": {"kind": "market", "asof": day, "requested_asof": args.asof,
-            "curve_source": "FRED THREEFY1..10 fitted continuously compounded zeros",
+            "curve_source": "Databento GLBX.MDP3 quarterly SR3 actual EOD settlements + FRED SOFR realised fixings",
+            "curve_bootstrap": curve_audit,
+            "curve_assumptions": "Zero futures-forward convexity adjustment; single curve; no OTC OIS quotes; no extrapolation",
             "spot_source": "FRED common-date daily observations; equity close and FX noon fixing are not synchronous with 15:05 UTC options",
             "carry": "Effective flat carry from parity forward and same-date FRED spot; timestamp basis approximation",
             "correlation": corr_info, "rate_volatility": "historical weekly DGS3MO change std * sqrt(52)",
+            "correlation_comparison":comparison,
+            "correlation_choice":"Retain existing weekly DGS3MO proxy; SOFR daily/weekly alternatives reported, not auto-selected",
             "mean_reversion": "assumed 0.05/year",
             "vendor_cost_estimate_usd": dl.spent,
             "fx_proxy": "European EUU futures-option Black IV used as a spot-FX proxy; futures/forward convexity and delivery-date basis omitted",
             "expiry_convention": "Vendor definition expiry timestamps, ACT/365; index fixing/settlement calendar not separately modelled",
             "flat_vol_extrapolation": "FX volatility is held flat beyond the calibration expiry for XCCY scenarios"},
             "curve": {"tenors": curve.tenors.tolist(), "zero_rates": curve.zero_rates.tolist()},
+            "sofr_bootstrap": {"asof":day, "required_horizon":5.,
+                "contracts":[{k:r[k] for k in ("symbol","year","month","price")} for r in curve_audit["contracts"]],
+                "fixings":{str(t):v for t,v in fixings.items() if t >= date.fromisoformat(curve_audit["contracts"][0]["start"])}},
             "hw_a": 0.05, "hw_sigma": rate_sigma, "eq_spot": spot, "fx_spot": fx,
             "eq_vol": eq_sigma, "fx_vol": fx_sigma, "eq_dividend": float(q),
             "foreign_rate": float(rf), "correlation": corr.tolist(),
@@ -187,6 +250,10 @@ def main():
     with open("data/local_market.json", "w") as f:
         json.dump(data, f, indent=2)
     print(json.dumps({"asof": day, "weekly_changes": corr_info["weekly_changes"],
+                      "sofr_contracts":len(curve_audit["contracts"]),
+                      "curve_coverage_years":curve_audit["coverage_years"],
+                      "max_futures_price_error":curve_audit["max_price_error"],
+                      "convexity_adjustment":0.,
                       "equity_iv": eq["iv"], "fx_iv": fxq["iv"],
                       "max_option_repricing_error": max(eq["repricing_error"], fxq["repricing_error"]),
                       "saved": "data/local_market.json"}, indent=2))
