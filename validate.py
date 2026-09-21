@@ -6,11 +6,13 @@ equity options and bond/spot controls, not a new product or notebook.
 import argparse
 import json
 from pathlib import Path
+from datetime import date
 import numpy as np
 from src.market_data import MarketData
 from src.engine import MonteCarloEngine
 from src.instruments import EuropeanOption, InterestRateSwap
 from src.risk import initial_context, independent_samples, mean_se, swap_risk
+from src.sofr_curve import SofrFuture, bootstrap_sofr, reprice_future
 
 
 def sample(md, n=8192, steps=365, seed=17, antithetic=True):
@@ -32,6 +34,19 @@ def run(md):
     model = md.rate_model()
     node_error = max(abs(model.bond(0.,float(t))-md.curve.discount(t)) for t in md.curve.tenors)
     check("Initial curve node fit",node_error,0)
+    futures_checks = []
+    if md.sofr_bootstrap:
+        inputs = md.sofr_bootstrap
+        asof = date.fromisoformat(inputs["asof"])
+        futures = [SofrFuture(**row) for row in inputs["contracts"]]
+        fixings = {date.fromisoformat(k):v for k,v in inputs["fixings"].items()}
+        rebuilt, _ = bootstrap_sofr(asof, futures, fixings, inputs["required_horizon"])
+        check("Saved curve agrees with rebuilt SR3 curve",
+              float(np.max(np.abs(rebuilt.discount(rebuilt.tenors)-md.curve.discount(rebuilt.tenors)))),0,atol=1e-12)
+        for future in futures:
+            fitted = reprice_future(md.curve,asof,future,fixings)
+            check(future.symbol+" zero-convexity futures repricing",fitted,future.price,atol=1e-8)
+            futures_checks.append({"symbol":future.symbol,"price_error":fitted-future.price})
     swap = InterestRateSwap("s",1e6,0,4)
     swap.fixed_rate = swap.par_rate(md.curve)
     check("Par swap NPV",swap.value(0,initial_context(md))[0],0,atol=1e-7)
@@ -94,6 +109,7 @@ def run(md):
                                "recovered_iv":float(recovered)}
     return {"input_kind":md.metadata.get("kind"),"asof":md.metadata.get("asof"),
             "passed":all(c["passed"] for c in checks),"checks":checks,
+            "sofr_futures_checks":futures_checks,
             "swap_risk":swap_risk(swap,md),"path_count_convergence":convergence,
             "time_step_convergence":time_steps,"market_iv_checks":quote_checks,
             "variance_reduction":{"replications":16,"paths_per_replication":2048,

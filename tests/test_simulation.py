@@ -61,6 +61,28 @@ def test_estimated_correlation_uses_common_actual_weekly_dates():
 def test_mean_se_uses_pairs():
     mean,se = mean_se(np.array([1.,2.,3.,4.]),True)
     assert mean == 2.5 and se == pytest.approx(.5)
+
+
+def test_sofr_correlation_diagnostic_respects_frequency_and_rate_choice():
+    dates = pd.bdate_range("2023-01-01", periods=300)
+    rng = np.random.default_rng(47)
+    moves = rng.normal(size=(len(dates),3))
+    frame = pd.DataFrame({"SOFR":4+np.cumsum(moves[:,0]*.01),
+                          "SP500":4000*np.exp(np.cumsum(moves[:,1]*.002)),
+                          "DEXUSEU":np.exp(np.cumsum(moves[:,2]*.002))}, index=dates)
+    matrix, info = estimate_correlation(frame, rate_column="SOFR", frequency="daily")
+    expected = pd.DataFrame({"r":frame.SOFR.diff()/100,
+                             "s":np.log(frame.SP500).diff(),
+                             "fx":np.log(frame.DEXUSEU).diff()}).dropna().corr().to_numpy()
+    np.testing.assert_allclose(matrix,.9*expected+.1*np.eye(3))
+    assert info["daily_changes"] == 299 and info["rate_column"] == "SOFR"
+    assert np.linalg.eigvalsh(matrix).min() > 0
+    _, weekly = estimate_correlation(frame, rate_column="SOFR")
+    assert weekly["weekly_changes"] < 65
+    with pytest.raises(ValueError, match="Frequency"):
+        estimate_correlation(frame, frequency="monthly")
+
+
 def test_rate_integral_discretisation_bias_converges_without_mc_noise():
     m = MarketData().rate_model()
     errors = []

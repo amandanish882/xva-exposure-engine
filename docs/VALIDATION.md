@@ -1,6 +1,6 @@
 # Validation record
 
-Run on 20 September 2026, Python 3.12, NumPy 2.5.3, SciPy 1.18.1,
+Run on 21 September 2026, Python 3.12, NumPy 2.5.3, SciPy 1.18.1,
 pandas 3.0.6 and QuantLib 1.43. This records checks on the upgraded implementation,
 not a claim of production model approval or validation of every market proxy.
 
@@ -13,13 +13,19 @@ python validate.py
 python main.py
 ```
 
-- **24 tests passed.** Coverage includes curve nodes/interpolation/negative
+- **49 tests passed.** Coverage includes curve nodes/interpolation/negative
   rates, independent Gaussian bond valuation, par swap/sign/DV01, fixed coupon
   schedules and past resets, no future-path lookahead, settled trades,
   FX and option parity, IV recovery/quote filtering/maturity selection,
   download-budget enforcement, realised shock correlation, martingales,
   pair-aware standard errors, time-discretisation bias, collateral timing,
   pathwise XVA discounting and a full daily-grid portfolio run.
+- New SOFR coverage includes front-quarter accrued fixings, IMM dates/leap
+  years, ACT/360 versus ACT/365, holiday/weekend day weights, negative rates,
+  no use of an unpublished same-day fixing, quote repricing, missing/gapped/
+  duplicate/insufficient strips, settlement date/status/deletion filters,
+  independent QuantLib bootstrap comparison, an end-to-end bootstrapped-curve
+  exposure test and the daily/weekly SOFR correlation diagnostic.
 - **12/12 synthetic analytical/Monte Carlo checks passed.** Statistical checks
   use a five-standard-error acceptance band plus a stated absolute tolerance.
   These are conservative regression checks, not narrow pricing accuracy guarantees.
@@ -71,22 +77,46 @@ replication error. The control-adjusted price also passed the analytical check.
 
 ## Private market-data validation
 
-The explicit live calibration selected a **2026-09-11** common FRED date and
-156 weekly changes. This is a historical snapshot, not a 20 September live quote.
-Two European near-ATM quote pairs passed the filters, with expiries approximately
-1.76 years for equity and 0.98 years for FX. The initial estimated Databento
-download cost was about USD 0.0432; this is an estimate, not an invoice.
+The explicit market calibration used a **2026-09-11** common FRED date and
+156 weekly changes. This is a historical snapshot, not a 21 September live quote.
+The new curve used **21 quarterly SR3 contracts**, extending to 17 September
+2031 (5.0192 ACT/365 years), plus realised FRED SOFR fixings for the front quarter.
+The additional SR3 definition/statistics download was estimated at **USD 0.00665**.
+Existing option downloads were reused from the local cache. Estimates are not invoices.
 
-**14/14 checks passed** with that snapshot, including both input-IV recovery
-checks. Black midpoint repricing errors were below `1e-10` in each quote's native
+All selected same-date settlement records in this snapshot carried CME's
+**actual, preliminary** status. They are explicitly labelled as such; no final
+settlement status or executable far-end liquidity is claimed.
+
+| SOFR bootstrap check | Result |
+|---|---:|
+| Maximum input futures repricing error | 4.27e-14 index-price points |
+| Maximum discount difference versus independent QuantLib bootstrap, 1,001 times | 3.18e-13 |
+| Convexity adjustment used by both bootstraps | 0 |
+| Four-year USD 1m par swap NPV | Less than USD 1e-7 in absolute value |
+| Signed payer parallel DV01 | USD 368.080 per +1bp |
+
+Two European near-ATM quote pairs passed the filters, with expiries approximately
+1.76 years for equity and 0.98 years for FX. Their IV/carry inputs were recomputed
+using the new discount curve, not copied unchanged from the Treasury snapshot.
+
+**36/36 checks passed** with that snapshot: the previous 14 pricing/MC/input-IV
+checks, one saved-versus-rebuilt curve check and 21 futures repricing checks.
+Black midpoint repricing errors were below `1e-10` in each quote's native
 price units. The full 2,000-path base/stress pipeline also completed. Raw quotes,
 the local snapshot and its detailed output are not published; run the documented
 calibration with your own access to reproduce the market-data workflow.
 
 IV recovery verifies the inversion/conversion algebra, not the economic validity
-of substituting a futures-option IV for spot FX. The Treasury/OIS distinction,
+of substituting a futures-option IV for spot FX. Zero futures convexity,
+the futures-versus-OTC-OIS distinction, preliminary settlement status,
 timestamp mismatch, expiry conventions and flat-vol extrapolation remain material
 limitations: see [data methodology](DATA.md).
+
+The diagnostic also compares SOFR and DGS3MO correlations on the same dates at
+daily and weekly frequencies. The matrices differ, including the sign of the
+weekly rates/FX estimate. This curve upgrade leaves the existing weekly DGS3MO
+simulation correlation unchanged; comparison alone does not justify a new proxy.
 
 ## Automation and change control
 

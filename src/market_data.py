@@ -10,23 +10,26 @@ from .rates import HullWhite
 DEFAULT_SNAPSHOT = Path(__file__).resolve().parents[1] / "data/demo_market.json"
 
 
-def estimate_correlation(frame, shrinkage=0.1, min_weeks=52):
+def estimate_correlation(frame, shrinkage=0.1, min_weeks=52, rate_column="DGS3MO", frequency="weekly"):
     if not 0 <= shrinkage <= 1:
         raise ValueError("Shrinkage outside [0,1]")
-    data = frame[["DGS3MO", "SP500", "DEXUSEU"]].sort_index().dropna()
+    if frequency not in ("weekly", "daily"):
+        raise ValueError("Frequency must be daily or weekly")
+    data = frame[[rate_column, "SP500", "DEXUSEU"]].sort_index().dropna()
     if data.index.has_duplicates or (data[["SP500", "DEXUSEU"]] <= 0).any().any():
         raise ValueError("Invalid historical observations")
     # One actual common-date row per week; no independently forward-filled closes.
-    weekly = data.groupby(data.index.to_period("W-FRI")).tail(1)
-    moves = pd.DataFrame({"rate": weekly.DGS3MO.diff()/100,
+    weekly = data.groupby(data.index.to_period("W-FRI")).tail(1) if frequency == "weekly" else data
+    moves = pd.DataFrame({"rate": weekly[rate_column].diff()/100,
                           "equity": np.log(weekly.SP500).diff(),
                           "fx": np.log(weekly.DEXUSEU).diff()}).dropna()
-    if len(moves) < min_weeks or (moves.std() <= 0).any():
+    if len(moves) < min_weeks or not np.isfinite(moves.to_numpy()).all() or (moves.std() <= 0).any():
         raise ValueError("Insufficient nonconstant common-date observations")
     sample = moves.corr().to_numpy()
     result = (1-shrinkage)*sample + shrinkage*np.eye(3)
     np.linalg.cholesky(result)
-    return result, {"weekly_changes": len(moves), "first": str(weekly.index[0].date()),
+    return result, {frequency+"_changes": len(moves), "rate_column":rate_column,
+                    "frequency":frequency, "first": str(weekly.index[0].date()),
                     "last": str(weekly.index[-1].date()), "shrinkage": shrinkage,
                     "sample_correlation": sample.tolist()}
 
@@ -53,6 +56,7 @@ class MarketData:
             raise ValueError("Invalid correlation matrix")
         np.linalg.cholesky(self.corr)
         self.iv_quotes = deepcopy(data.get("iv_quotes", {}))
+        self.sofr_bootstrap = deepcopy(data.get("sofr_bootstrap"))
         self.rate_model()
 
     @property

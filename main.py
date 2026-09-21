@@ -63,6 +63,8 @@ def main():
                                 trades, args.n_sims, args.seed, hazard=.03)
     risk = swap_risk(trades[0][0], md)
     summary = {"data_kind": md.metadata.get("kind"), "asof": md.metadata.get("asof"),
+               "curve_source":md.metadata.get("curve_source", "Synthetic zero-node fixture"),
+               "curve_bootstrap":md.metadata.get("curve_bootstrap"),
                "paths": args.n_sims, "seed": args.seed, "time_points": len(times),
                "swap_risk": risk, "correlation": md.corr.tolist(), "base": xb, "stress": xs}
     if not np.isfinite([v for group in (xb, xs) for d in group.values() for v in d.values()]).all():
@@ -71,12 +73,15 @@ def main():
         json.dump(summary, f, indent=2)
     plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False})
     fig, axes = plt.subplots(1,2, figsize=(11,4))
-    grid = np.linspace(.001, 10, 800)
+    grid = np.linspace(.001, md.curve.tenors[-1], 800)
     axes[0].plot(grid, 100*md.curve.zero(grid), label="Zero rate")
     axes[0].plot(grid, 100*md.curve.forward(grid), label="Forward", alpha=.7)
-    axes[0].set(xlabel="Years", ylabel="Percent", title="Treasury proxy curve")
+    title = "SOFR futures curve (zero convexity)" if md.sofr_bootstrap else "Input discount curve"
+    axes[0].set(xlabel="Years", ylabel="Percent", title=title)
     axes[0].legend()
-    axes[1].bar(list(risk["key_rate_dv01"]), list(risk["key_rate_dv01"].values()))
+    labels = [f"{float(t):.2f}" for t in risk["key_rate_dv01"]]
+    axes[1].bar(labels, list(risk["key_rate_dv01"].values()))
+    axes[1].tick_params(axis="x", labelrotation=60, labelsize=8)
     axes[1].set(xlabel="Curve node (years)", ylabel="USD / +1bp", title="Payer swap key-rate DV01")
     fig.tight_layout()
     fig.savefig(out/"curve_and_risk.png", dpi=140)
